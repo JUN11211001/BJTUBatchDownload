@@ -335,7 +335,8 @@ chrome.runtime.onMessage.addListener((msg) => {
       completedDl = msg.completed; totalDl = msg.total;
       updateProgressBar(msg.completed, msg.total);
       const icon = { success: '✓', error: '✗', downloading: '↓' }[msg.status] || '·';
-      addLog(`${icon} ${msg.file}`, msg.status === 'error' ? 'error' : 'success');
+      const detail = msg.msg ? ` (${msg.msg})` : '';
+      addLog(`${icon} ${msg.file}${detail}`, msg.status === 'error' ? 'error' : msg.status === 'success' ? 'success' : 'info');
     } else if (msg.type === 'done') {
       isDownloading = false;
       document.getElementById('btnStopDownload').classList.add('hidden');

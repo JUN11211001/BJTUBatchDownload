@@ -38,6 +38,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 // ── 消息路由 ──
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // service worker 重启后 pageTabId 丢失；每次收到页面消息时顺带恢复
+  if (sender.tab && sender.url?.startsWith(chrome.runtime.getURL('src/page/'))) {
+    pageTabId = sender.tab.id;
+  }
   switch (msg.action) {
     case 'checkConnectivity':
       checkConnectivity().then(sendResponse);
@@ -288,44 +292,99 @@ async function waitTabComplete(tabId, timeout = 20000) {
   });
 }
 
-// ── 获取文件真实下载 URL 及真实文件名 ──
-async function resolveRpUrl(rpId) {
+// ── 下载批次复用的标签页 ──
+let dlTabId = null; // 整批复用，避免每个文件各开一个后台 tab
+
+// 确保有可用的 123.121.147.7 tab 供 executeScript 注入
+// 返回新开的 tab（调用方负责关闭），若复用已有 tab 则返回 null
+async function ensureDlTab() {
   const tabs = await chrome.tabs.query({});
-  const tab = tabs.find(t => t.url?.includes('123.121.147.7'));
-  if (!tab) return { url: '', dlFilename: '' };
+  const exist = tabs.find(t =>
+    t.url?.includes('123.121.147.7') &&
+    t.id !== pageTabId
+  );
+  if (exist) { dlTabId = exist.id; return null; }
+
+  const bg = await chrome.tabs.create({
+    url: `${COURSE_BASE}/back/coursePlatform/coursePlatform.shtml?method=toCoursePlatformIndex`,
+    active: false
+  });
+  await waitTabComplete(bg.id, 15000);
+  dlTabId = bg.id;
+  return bg;
+}
+
+// ── 获取文件真实下载 URL（从注入页上下文发请求，保证同源 + Cookie）──
+async function resolveRpUrl(rpId) {
+  if (!dlTabId) return { url: '', ext: '' };
+  try { await chrome.tabs.get(dlTabId); } catch { return { url: '', ext: '' }; }
 
   try {
     const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: dlTabId },
       args: [rpId, apiSessionId],
       func: async (rpId, sid) => {
         const BASE = 'http://123.121.147.7:88/ve';
-        const headers = {};
-        if (sid) headers.sessionId = sid;
-        const res = await fetch(
-          `${BASE}/back/resourceSpace.shtml?method=rpinfoDownloadUrl&rpId=${rpId}`,
-          { method: 'POST', headers }
-        );
-        const d = await res.json().catch(() => ({}));
-        let url = d.rpUrl || '';
-        if (!url) return { url: '', dlFilename: '' };
-        if (!url.startsWith('http')) url = BASE + (url.startsWith('/') ? '' : '/') + url;
+        const headers = sid ? { sessionId: sid } : {};
 
-        let dlFilename = '';
+        // 1. 获取真实下载 URL
+        let url = '';
         try {
-          const head = await fetch(url, { method: 'HEAD' });
+          const res = await fetch(
+            `${BASE}/back/resourceSpace.shtml?method=rpinfoDownloadUrl&rpId=${rpId}`,
+            { method: 'POST', headers, signal: AbortSignal.timeout(10000) }
+          );
+          const d = await res.json().catch(() => ({}));
+          url = d.rpUrl || '';
+          if (!url) return { url: '', ext: '' };
+          if (!url.startsWith('http')) url = BASE + (url.startsWith('/') ? '' : '/') + url;
+        } catch { return { url: '', ext: '' }; }
+
+        // 2. HEAD 请求：读 Content-Disposition 文件名 & Content-Type
+        //    超时 4s 则跳过，不卡下载
+        let ext = '';
+        try {
+          const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
+
+          // Content-Disposition 优先
           const cd = head.headers.get('content-disposition') || '';
-          const m = cd.match(/filename\*=UTF-8''([^;\r\n]+)/i)
+          const mcd = cd.match(/filename\*=UTF-8''([^;\r\n]+)/i)
             || cd.match(/filename="([^"]+)"/i)
             || cd.match(/filename=([^;\r\n]+)/i);
-          if (m) dlFilename = decodeURIComponent(m[1].trim().replace(/^["']|["']$/g, ''));
+          if (mcd) {
+            const fn = decodeURIComponent(mcd[1].trim().replace(/^["']|["']$/g, ''));
+            const me = fn.match(/(\.[a-zA-Z0-9]{2,6})$/);
+            if (me) ext = me[1].toLowerCase();
+          }
+
+          // Content-Type 兜底
+          if (!ext) {
+            const ct = (head.headers.get('content-type') || '').split(';')[0].trim();
+            const ctMap = {
+              'application/pdf': '.pdf',
+              'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+              'application/vnd.ms-powerpoint': '.ppt',
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+              'application/msword': '.doc',
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+              'application/vnd.ms-excel': '.xls',
+              'application/zip': '.zip',
+              'application/x-zip-compressed': '.zip',
+              'video/mp4': '.mp4',
+              'video/x-msvideo': '.avi',
+              'image/jpeg': '.jpg',
+              'image/png': '.png',
+              'text/plain': '.txt',
+            };
+            if (ctMap[ct]) ext = ctMap[ct];
+          }
         } catch {}
 
-        return { url, dlFilename };
+        return { url, ext };
       }
     });
-    return result || { url: '', dlFilename: '' };
-  } catch { return { url: '', dlFilename: '' }; }
+    return result || { url: '', ext: '' };
+  } catch { return { url: '', ext: '' }; }
 }
 
 // ── 下载队列 ──
@@ -343,61 +402,97 @@ async function startDownload(files, sessionId, rootFolder) {
 
   broadcastToPage({ action: 'downloadProgress', type: 'start', total: totalCount });
 
+  // 整批共用一个 tab，避免每文件反复开/关
+  let openedBgTab = null;
+  try {
+    openedBgTab = await ensureDlTab();
+  } catch (e) {
+    broadcastToPage({ action: 'downloadProgress', type: 'progress', file: '初始化', status: 'error', completed: 0, total: totalCount, msg: '无法打开课程平台标签页: ' + e.message });
+  }
+
   for (const file of files) {
     if (stopFlag) break;
     await downloadSingleFile(file, rootFolder);
   }
 
+  if (openedBgTab) chrome.tabs.remove(openedBgTab.id).catch(() => {});
+  dlTabId = null;
   isDownloading = false;
   broadcastToPage({ action: 'downloadProgress', type: 'done', completed: completedCount, total: totalCount });
 }
 
 async function downloadSingleFile(file, rootFolder) {
   broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status: 'downloading', completed: completedCount, total: totalCount });
-  try {
-    const { url, dlFilename } = await resolveRpUrl(file.rpId);
-    if (!url) throw new Error('未获取到下载链接');
 
-    let dlName = file.fileName || file.name;
-    if (dlFilename) {
-      const dotIdx = dlFilename.lastIndexOf('.');
-      if (dotIdx > 0 && !dlName.includes('.')) {
-        dlName = dlName + dlFilename.substring(dotIdx);
-      }
-    } else if (!dlName.includes('.') && file.fileType) {
-      dlName = dlName + '.' + file.fileType.toLowerCase().replace(/^\./, '');
+  const fail = (msg) => {
+    broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status: 'error', completed: ++completedCount, total: totalCount, msg });
+  };
+
+  try {
+    const { url, ext: serverExt } = await resolveRpUrl(file.rpId);
+    if (!url) { fail('未获取到下载链接'); return; }
+
+    // 扩展名四级优先：HEAD(CD/CT) > URL路径 > RP_PRIX > 无
+    let ext = serverExt || '';
+    if (!ext) {
+      try {
+        const m = new URL(url).pathname.match(/(\.[a-zA-Z0-9]{2,6})$/);
+        if (m) ext = m[1].toLowerCase();
+      } catch {}
+    }
+    if (!ext && file.fileType) {
+      ext = '.' + file.fileType.toLowerCase().replace(/^\./, '');
     }
 
-    const parts = [rootFolder, file.courseName];
-    if (file.folderPath) parts.push(file.folderPath);
-    parts.push(dlName);
-    const filename = parts.filter(Boolean).map(s => s.replace(/[\\/:*?"<>|]/g, '_').trim()).join('/');
+    let dlName = (file.fileName || file.name || 'download').trim();
+    if (ext && !/\.[a-zA-Z0-9]{2,6}$/.test(dlName)) dlName += ext;
+
+    const sanitize = s => s.replace(/[\\/:*?"<>|]/g, '_').trim();
+    const parts = [rootFolder, file.courseName, file.folderPath, dlName].filter(Boolean);
+    const filename = parts.map(sanitize).join('/');
 
     await new Promise((resolve) => {
+      const done = (status, msg) => {
+        broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status, completed: ++completedCount, total: totalCount, msg });
+        resolve();
+      };
+
       chrome.downloads.download({ url, filename, conflictAction: 'uniquify', saveAs: false }, (dlId) => {
         if (chrome.runtime.lastError || !dlId) {
-          broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status: 'error', completed: ++completedCount, total: totalCount });
-          resolve(); return;
+          done('error', chrome.runtime.lastError?.message || '下载启动失败');
+          return;
         }
+
+        // 安全兜底：若 onChanged 始终未触发（SW 生命周期问题），30分钟后强制推进
+        const safeTimer = setTimeout(() => {
+          chrome.downloads.onChanged.removeListener(onChange);
+          done('success');
+        }, 30 * 60 * 1000);
+
         const onChange = (delta) => {
           if (delta.id !== dlId) return;
           const s = delta.state?.current;
           if (s === 'complete' || s === 'interrupted') {
+            clearTimeout(safeTimer);
             chrome.downloads.onChanged.removeListener(onChange);
-            broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status: s === 'complete' ? 'success' : 'error', completed: ++completedCount, total: totalCount });
-            resolve();
+            done(s === 'complete' ? 'success' : 'error', s === 'interrupted' ? '下载中断' : '');
           }
         };
         chrome.downloads.onChanged.addListener(onChange);
       });
     });
-  } catch {
-    broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status: 'error', completed: ++completedCount, total: totalCount });
+  } catch (e) {
+    fail(e.message || '未知错误');
   }
 }
 
 // ── 广播到插件页面 ──
-function broadcastToPage(data) {
-  if (pageTabId === null) return;
-  chrome.tabs.sendMessage(pageTabId, data).catch(() => {});
+// 不依赖 pageTabId——SW 重启后变量丢失；先试缓存值，失败则动态查找
+async function broadcastToPage(data) {
+  const tryTab = async (id) => {
+    try { await chrome.tabs.sendMessage(id, data); return true; } catch { return false; }
+  };
+  if (pageTabId !== null && await tryTab(pageTabId)) return;
+  const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('src/page/page.html') }).catch(() => []);
+  if (tabs.length) { pageTabId = tabs[0].id; await tryTab(pageTabId); }
 }

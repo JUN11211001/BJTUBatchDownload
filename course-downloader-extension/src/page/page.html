@@ -36,8 +36,10 @@
             <span class="toggle-thumb"></span>
           </label>
         </label>
+        <span class="ka-info-icon"
+          data-tooltip="防止 MIS 登录会话因长时间未操作而过期。开启后每 5 分钟自动向 MIS 首页发送一次带 Cookie 的心跳请求，触发服务器端会话续期，避免下载途中突然失效需要重新登录。底层使用 Chrome Alarms API 定时唤醒 Service Worker，在后台静默发起请求，不打开任何新页面。">ⓘ</span>
         <span id="keepAliveInfo" class="keepalive-info"></span>
-        <button id="btnPingNow" class="btn btn-xs btn-ghost-top" title="立即刷新会话">刷新</button>
+        <button id="btnPingNow" class="btn btn-xs btn-ghost-top" title="立即向 MIS 发送心跳、刷新登录会话">刷新</button>
       </div>
       <!-- 根目录 -->
       <label class="setting-inline">

@@ -118,6 +118,58 @@ body {
 .toggle-switch input:checked + .toggle-thumb::before { transform: translateX(14px); }
 .keepalive-info { font-size: 11px; color: rgba(255,255,255,.7); white-space: nowrap; }
 
+/* ── Keep-alive 信息图标 & 工具提示 ── */
+.ka-info-icon {
+  font-size: 13px;
+  cursor: help;
+  opacity: .75;
+  position: relative;
+  flex-shrink: 0;
+  line-height: 1;
+}
+.ka-info-icon:hover { opacity: 1; }
+
+.ka-info-icon::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  left: auto;
+  transform: none;
+  width: 280px;
+  background: rgba(20, 30, 48, .97);
+  color: rgba(255,255,255,.92);
+  font-size: 12px;
+  line-height: 1.65;
+  padding: 10px 13px;
+  border-radius: 7px;
+  box-shadow: 0 4px 18px rgba(0,0,0,.45);
+  white-space: normal;
+  word-break: break-all;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .18s;
+  z-index: 9999;
+  font-weight: 400;
+  letter-spacing: .2px;
+}
+.ka-info-icon::before {
+  content: '';
+  position: absolute;
+  top: calc(100% + 3px);
+  right: 6px;
+  left: auto;
+  transform: none;
+  border: 5px solid transparent;
+  border-bottom-color: rgba(20, 30, 48, .97);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .18s;
+  z-index: 9999;
+}
+.ka-info-icon:hover::after,
+.ka-info-icon:hover::before { opacity: 1; }
+
 .setting-inline { color: rgba(255,255,255,.9); font-size: 12px; white-space: nowrap; }
 .setting-inline input {
   padding: 2px 6px;
