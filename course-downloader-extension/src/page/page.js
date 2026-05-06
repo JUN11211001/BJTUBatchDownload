@@ -19,18 +19,24 @@ async function init() {
   setConnStatus('mis', 'checking');
   setConnStatus('course', 'checking');
 
-  // 连接检测后台运行，不阻塞主界面
+  // 立即显示主界面，不等任何网络请求
+  showMainContent();
+  window._courseLoading = true;
+  renderCourses([]);
+
+  // 后台异步：连接检测
   chrome.runtime.sendMessage({ action: 'checkConnectivity' })
     .then(conn => { if (conn) updateConnUI(conn); })
     .catch(() => {});
 
-  const info = await getPageInfo().catch(() => null);
-
-  if (info?.sessionId) sessionId = info.sessionId;
-  window._pageTabFound = info?.tabFound ?? false;
-
-  showMainContent();
-  renderCourses(info?.courses || []);
+  // 后台异步：自动打开课程页、加载课程列表
+  getPageInfo()
+    .then(info => {
+      window._courseLoading = false;
+      if (info?.sessionId) sessionId = info.sessionId;
+      renderCourses(info?.courses || []);
+    })
+    .catch(() => { window._courseLoading = false; renderCourses([]); });
 }
 
 function updateConnUI(conn) {
@@ -71,15 +77,13 @@ function renderCourses(list) {
   const el = document.getElementById('courseList');
 
   if (!courses.length) {
-    const hint = window._pageTabFound
-      ? '已找到课程平台标签页，但未识别到课程。<br>请确认当前页面是「我的课程」列表页，等待页面完全加载后点击 ↻ 重新检测'
-      : '未找到课程平台标签页。<br>请先在浏览器中打开下方链接，等页面加载完成后点击 ↻ 重新检测';
-    el.innerHTML = `
-      <div class="empty-tip">
-        ${hint}<br><br>
-        <a href="http://123.121.147.7:88/ve/back/coursePlatform/coursePlatform.shtml?method=toCoursePlatformIndex"
-           target="_blank" style="color:#4a7fd4;font-size:12px">打开 MIS 课程中心</a>
-      </div>`;
+    el.innerHTML = window._courseLoading
+      ? '<div class="empty-tip">正在自动加载课程列表，请稍候...</div>'
+      : `<div class="empty-tip">
+           未检测到课程，请确认已登录 MIS 系统且处于校园网 / VPN 环境，然后点击 ↻ 重新检测。<br><br>
+           <a href="http://123.121.147.7:88/ve/back/coursePlatform/coursePlatform.shtml?method=toCoursePlatformIndex"
+              target="_blank" style="color:#4a7fd4;font-size:12px">手动打开课程中心</a>
+         </div>`;
     return;
   }
 
@@ -187,73 +191,79 @@ function renderFileGroup(course, files) {
 
   const canDl = files.filter(f => f.canDownload).length;
   const locked = files.length - canDl;
+  const num = course.courseNum;
 
   const g = document.createElement('div');
   g.className = 'course-group';
-  g.id = `group-${course.courseNum}`;
-  const num = course.courseNum;
+  g.id = `group-${num}`;
 
-  g.innerHTML = `
-    <div class="course-group-header" onclick="toggleGroup('${esc(num)}')">
-      <div>
-        <div class="course-group-title">${esc(course.name)}</div>
-        <div class="course-group-meta">${canDl} 可下载 · ${locked} 受限 · 共 ${files.length} 个</div>
-      </div>
-      <div class="course-group-right">
-        <span class="course-group-toggle" id="tog-${esc(num)}">▾</span>
-      </div>
+  const header = document.createElement('div');
+  header.className = 'course-group-header';
+  header.innerHTML = `
+    <div>
+      <div class="course-group-title">${esc(course.name)}</div>
+      <div class="course-group-meta">${canDl} 可下载 · ${locked} 受限 · 共 ${files.length} 个</div>
     </div>
-    <div id="gbody-${esc(num)}">
-      ${files.length === 0
-        ? '<div class="empty-tip" style="padding:20px">该课程暂无课件</div>'
-        : `<table class="file-table">
-            <thead><tr>
-              <th style="width:30px">
-                <input type="checkbox" id="chk-all-${esc(num)}"
-                  onchange="toggleGroupFiles('${esc(num)}',this.checked)">
-              </th>
-              <th>文件名</th><th style="width:60px">类型</th><th style="width:70px">状态</th>
-            </tr></thead>
-            <tbody>
-              ${files.map(f => `
-                <tr>
-                  <td>${f.canDownload
-                    ? `<input type="checkbox" class="file-chk"
-                        data-rpid="${esc(f.rpId)}" data-course="${esc(num)}"
-                        data-name="${esc(f.name)}" data-folder="${esc(f.folderPath||'')}"
-                        onchange="onFileCheck(this)">`
-                    : '<input type="checkbox" disabled>'
-                  }</td>
-                  <td class="file-name">
-                    <span class="file-name-text" title="${esc(f.name)}">${fileIcon(f.name, f.fileType)} ${esc(f.name)}</span>
-                    ${f.folderPath ? `<span class="file-path">📁 ${esc(f.folderPath)}</span>` : ''}
-                  </td>
-                  <td><span class="type-badge">${esc(fileTypeName(f))}</span></td>
-                  <td>${f.canDownload ? '<span class="tag-ok">可下载</span>' : '<span class="tag-locked">受限</span>'}</td>
-                </tr>`).join('')}
-            </tbody>
-          </table>`}
+    <div class="course-group-right">
+      <span class="course-group-toggle" id="tog-${esc(num)}">▾</span>
     </div>`;
+  header.addEventListener('click', () => toggleGroup(num));
 
+  const body = document.createElement('div');
+  body.id = `gbody-${esc(num)}`;
+
+  if (files.length === 0) {
+    body.innerHTML = '<div class="empty-tip" style="padding:20px">该课程暂无课件</div>';
+  } else {
+    const table = document.createElement('table');
+    table.className = 'file-table';
+    table.innerHTML = `
+      <thead><tr>
+        <th style="width:30px"><input type="checkbox" id="chk-all-${esc(num)}"></th>
+        <th>文件名</th><th style="width:60px">类型</th><th style="width:70px">状态</th>
+      </tr></thead>
+      <tbody>
+        ${files.map(f => `
+          <tr>
+            <td>${f.canDownload
+              ? `<input type="checkbox" class="file-chk"
+                  data-rpid="${esc(f.rpId)}" data-course="${esc(num)}"
+                  data-name="${esc(f.name)}" data-folder="${esc(f.folderPath||'')}"
+                  data-filetype="${esc(f.fileType||'')}">`
+              : '<input type="checkbox" disabled>'
+            }</td>
+            <td class="file-name">
+              <span class="file-name-text" title="${esc(f.name)}">${fileIcon(f.name, f.fileType)} ${esc(f.name)}</span>
+              ${f.folderPath ? `<span class="file-path">📁 ${esc(f.folderPath)}</span>` : ''}
+            </td>
+            <td><span class="type-badge">${esc(fileTypeName(f))}</span></td>
+            <td>${f.canDownload ? '<span class="tag-ok">可下载</span>' : '<span class="tag-locked">受限</span>'}</td>
+          </tr>`).join('')}
+      </tbody>`;
+
+    const chkAll = table.querySelector(`#chk-all-${esc(num)}`);
+    chkAll?.addEventListener('change', () => {
+      table.querySelectorAll('.file-chk').forEach(c => { c.checked = chkAll.checked; onFileCheck(c); });
+    });
+    table.querySelectorAll('.file-chk').forEach(c => c.addEventListener('change', () => onFileCheck(c)));
+
+    body.appendChild(table);
+  }
+
+  g.appendChild(header);
+  g.appendChild(body);
   panel.appendChild(g);
   g.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-window.toggleGroup = (num) => {
+function toggleGroup(num) {
   const body = document.getElementById(`gbody-${num}`);
   const tog = document.getElementById(`tog-${num}`);
   if (!body) return;
   const hidden = body.style.display === 'none';
   body.style.display = hidden ? '' : 'none';
-  tog.textContent = hidden ? '▾' : '▸';
-};
-
-window.toggleGroupFiles = (num, checked) => {
-  document.querySelectorAll(`.file-chk[data-course="${num}"]`).forEach(c => {
-    c.checked = checked;
-    onFileCheck(c);
-  });
-};
+  if (tog) tog.textContent = hidden ? '▾' : '▸';
+}
 
 function onFileCheck(el) {
   el.checked ? selectedFiles.add(el.dataset.rpid) : selectedFiles.delete(el.dataset.rpid);
@@ -284,6 +294,7 @@ function buildSelectedFilesList() {
       name: el.dataset.name,
       fileName: el.dataset.name,
       folderPath: el.dataset.folder,
+      fileType: el.dataset.filetype || '',
       courseName: c?.name || el.dataset.course
     });
   });

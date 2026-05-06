@@ -99,40 +99,93 @@ async function pingMisNow() {
   }
 }
 
-// ── 从课程列表标签页提取课程数据 ──
+// ── 获取课程列表 ──
 async function getPageDataFromTab() {
-  const tabs = await chrome.tabs.query({});
-  const target =
-    tabs.find(t => t.url?.includes('123.121.147.7') && t.url?.includes('toCoursePlatformIndex')) ||
-    tabs.find(t => t.url?.includes('123.121.147.7')) || null;
-
-  if (!target) return { sessionId: '', courses: [], tabFound: false };
+  const INDEX_URL = `${COURSE_BASE}/back/coursePlatform/coursePlatform.shtml?method=toCoursePlatformIndex`;
+  let bgTab;
 
   try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: target.id },
-      func: () => {
-        const sessionId = document.getElementById('sessionId')?.value
-          || new URLSearchParams(location.search).get('sessionId')
-          || (typeof window.sessionId !== 'undefined' ? String(window.sessionId) : '')
-          || '';
+    bgTab = await chrome.tabs.create({ url: INDEX_URL, active: false });
+    await waitTabComplete(bgTab.id, 15000);
 
-        const courses = [];
-        document.querySelectorAll('.courseItem').forEach(item => {
-          const oc = item.getAttribute('onclick') || '';
-          const m = oc.match(/goPage\(\s*['"](\d+)['"]\s*,\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)/);
-          if (!m) return;
-          const nameEl = item.querySelector('.course-text[title]') || item.querySelector('.course-text');
-          const name = (nameEl?.getAttribute('title') || nameEl?.textContent || '').trim();
-          if (name) courses.push({ cId: m[1], courseNum: m[2], xkhId: m[3], xqCode: m[4], name });
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: bgTab.id },
+      func: async () => {
+        const BASE = 'http://123.121.147.7:88/ve';
+
+        // 从页面服务端渲染的 JS 中提取 API sessionId（32位大写十六进制）
+        let sid = '';
+        for (const s of document.scripts) {
+          const m = (s.textContent || '').match(/setRequestHeader\s*\(\s*["']sessionId["']\s*,\s*["']([A-F0-9]{32})["']\s*\)/i);
+          if (m) { sid = m[1]; break; }
+        }
+        if (!sid) sid = document.getElementById('sessionId')?.value || '';
+
+        // 等待页面自身的 getCourseList AJAX 完成（最多 10 秒）
+        const items = await new Promise(resolve => {
+          const deadline = Date.now() + 10000;
+          const tick = () => {
+            const els = document.querySelectorAll('.courseItem');
+            if (els.length || Date.now() > deadline) resolve(els);
+            else setTimeout(tick, 300);
+          };
+          tick();
         });
 
-        return { sessionId, courses, url: location.href, tabFound: true };
+        if (items.length) {
+          const courses = [];
+          items.forEach(el => {
+            const oc = el.getAttribute('onclick') || '';
+            const m = oc.match(/goPage\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*\)/);
+            if (!m) return;
+            const nameEl = el.querySelector('.course-text[title]') || el.querySelector('.course-text');
+            const name = (nameEl?.getAttribute('title') || nameEl?.textContent || '').trim();
+            if (name) courses.push({ cId: m[1], courseNum: m[2], xkhId: m[3], xqCode: m[4], name });
+          });
+          if (courses.length) return { sessionId: sid, courses, tabFound: true };
+        }
+
+        // DOM 无数据时回退：用提取到的 sid 直接调 API
+        try {
+          const xqRes = await fetch(`${BASE}/back/rp/common/teachCalendar.shtml?method=queryCurrentXq`);
+          const xqData = await xqRes.json().catch(() => ({}));
+          let xqCode = '';
+          if (xqData.STATUS === '0' && Array.isArray(xqData.result)) {
+            const cur = xqData.result.find(r => r.currentFlag == 2) || xqData.result[0];
+            xqCode = cur?.xqCode || '';
+          }
+          if (xqCode) {
+            const listRes = await fetch(
+              `${BASE}/back/coursePlatform/course.shtml?method=getCourseList&pagesize=100&page=1&xqCode=${xqCode}`,
+              { headers: sid ? { sessionId: sid } : {} }
+            );
+            const data = await listRes.json().catch(() => ({}));
+            if (data.STATUS === '0' && Array.isArray(data.courseList) && data.courseList.length) {
+              return {
+                sessionId: sid,
+                courses: data.courseList.map(item => ({
+                  cId: String(item.id || ''),
+                  courseNum: item.course_num || '',
+                  xkhId: item.fz_id || '',
+                  xqCode: item.xq_code || xqCode,
+                  name: item.name || ''
+                })).filter(c => c.name),
+                tabFound: true
+              };
+            }
+          }
+        } catch {}
+
+        return { sessionId: sid, courses: [], tabFound: true };
       }
     });
+
+    if (result?.sessionId) apiSessionId = result.sessionId;
     return result || { sessionId: '', courses: [], tabFound: true };
   } catch (e) {
     return { sessionId: '', courses: [], tabFound: true, error: e.message };
+  } finally {
+    if (bgTab) chrome.tabs.remove(bgTab.id).catch(() => {});
   }
 }
 
@@ -212,20 +265,25 @@ async function scanCourseFiles(course) {
 }
 
 // 等待标签页加载完成
-function waitTabComplete(tabId, timeout = 20000) {
+async function waitTabComplete(tabId, timeout = 20000) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === 'complete') return;
+  } catch { return; }
+
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
       resolve();
     }, timeout);
 
-    function listener(id, info) {
+    const listener = (id, info) => {
       if (id === tabId && info.status === 'complete') {
         clearTimeout(timer);
         chrome.tabs.onUpdated.removeListener(listener);
-        setTimeout(resolve, 500);
+        setTimeout(resolve, 800);
       }
-    }
+    };
     chrome.tabs.onUpdated.addListener(listener);
   });
 }
@@ -306,6 +364,8 @@ async function downloadSingleFile(file, rootFolder) {
       if (dotIdx > 0 && !dlName.includes('.')) {
         dlName = dlName + dlFilename.substring(dotIdx);
       }
+    } else if (!dlName.includes('.') && file.fileType) {
+      dlName = dlName + '.' + file.fileType.toLowerCase().replace(/^\./, '');
     }
 
     const parts = [rootFolder, file.courseName];
