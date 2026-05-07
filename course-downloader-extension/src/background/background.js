@@ -239,10 +239,14 @@ async function scanCourseFiles(course) {
 
         function toFile(item, folderPath) {
           const t = item.RP_PRIX;
+          // Try to extract extension from rpName itself (e.g. "第一章.pptx")
+          const nameExt = (item.rpName || '').match(/(\.[a-zA-Z0-9]{2,6})$/)?.[1]?.toLowerCase() || '';
+          // RP_PRIX may also come as "PPT", "PDF", etc. or be absent/"undefined"
+          const rpType = (t && t !== 'undefined' && t !== 'null') ? t.toLowerCase() : '';
           return {
             rpId: item.rpId,
             name: item.rpName,
-            fileType: (t && t !== 'undefined' && t !== 'null') ? t.toLowerCase() : '',
+            fileType: rpType || nameExt.replace(/^\./, ''),
             canDownload: item.stu_download == '2',
             folderPath
           };
@@ -340,45 +344,86 @@ async function resolveRpUrl(rpId) {
           if (!url.startsWith('http')) url = BASE + (url.startsWith('/') ? '' : '/') + url;
         } catch { return { url: '', ext: '' }; }
 
-        // 2. HEAD 请求：读 Content-Disposition 文件名 & Content-Type
-        //    超时 4s 则跳过，不卡下载
-        let ext = '';
-        try {
-          const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
+        // 2. HEAD 请求：读 Content-Disposition / Content-Type / 重定向目标路径
+        const SCRIPT_EXTS = new Set(['.shtml','.html','.htm','.php','.asp','.aspx','.jsp','.do','.action','.cgi','.pl']);
+        const CT_MAP = {
+          'application/pdf': '.pdf',
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+          'application/vnd.ms-powerpoint': '.ppt',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+          'application/msword': '.doc',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+          'application/vnd.ms-excel': '.xls',
+          'application/zip': '.zip',
+          'application/x-zip-compressed': '.zip',
+          'video/mp4': '.mp4',
+          'video/x-msvideo': '.avi',
+          'image/jpeg': '.jpg',
+          'image/png': '.png',
+          'text/plain': '.txt',
+        };
 
-          // Content-Disposition 优先
+        let ext = '';
+        let headContentType = '';
+        try {
+          const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(6000) });
+          headContentType = (head.headers.get('content-type') || '').split(';')[0].trim();
+
+          // Priority 1: Content-Disposition filename
           const cd = head.headers.get('content-disposition') || '';
           const mcd = cd.match(/filename\*=UTF-8''([^;\r\n]+)/i)
+            || cd.match(/filename\*=GBK''([^;\r\n]+)/i)
             || cd.match(/filename="([^"]+)"/i)
             || cd.match(/filename=([^;\r\n]+)/i);
           if (mcd) {
-            const fn = decodeURIComponent(mcd[1].trim().replace(/^["']|["']$/g, ''));
-            const me = fn.match(/(\.[a-zA-Z0-9]{2,6})$/);
-            if (me) ext = me[1].toLowerCase();
+            try {
+              const fn = decodeURIComponent(mcd[1].trim().replace(/^["']|["']$/g, ''));
+              const me = fn.match(/(\.[a-zA-Z0-9]{2,6})$/);
+              if (me) ext = me[1].toLowerCase();
+            } catch {
+              const fn = mcd[1].trim().replace(/^["']|["']$/g, '');
+              const me = fn.match(/(\.[a-zA-Z0-9]{2,6})$/);
+              if (me) ext = me[1].toLowerCase();
+            }
           }
 
-          // Content-Type 兜底
+          // Priority 2: Content-Type mapping
+          if (!ext && CT_MAP[headContentType]) ext = CT_MAP[headContentType];
+
+          // Priority 3: redirect destination URL path
           if (!ext) {
-            const ct = (head.headers.get('content-type') || '').split(';')[0].trim();
-            const ctMap = {
-              'application/pdf': '.pdf',
-              'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
-              'application/vnd.ms-powerpoint': '.ppt',
-              'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
-              'application/msword': '.doc',
-              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
-              'application/vnd.ms-excel': '.xls',
-              'application/zip': '.zip',
-              'application/x-zip-compressed': '.zip',
-              'video/mp4': '.mp4',
-              'video/x-msvideo': '.avi',
-              'image/jpeg': '.jpg',
-              'image/png': '.png',
-              'text/plain': '.txt',
-            };
-            if (ctMap[ct]) ext = ctMap[ct];
+            try {
+              const finalPath = new URL(head.url).pathname;
+              const m = finalPath.match(/(\.[a-zA-Z0-9]{2,6})$/);
+              if (m && !SCRIPT_EXTS.has(m[1].toLowerCase())) ext = m[1].toLowerCase();
+            } catch {}
           }
         } catch {}
+
+        // Priority 4: magic byte detection (Range GET first 8 bytes) — only when all else failed
+        if (!ext) {
+          try {
+            const peek = await fetch(url, {
+              method: 'GET',
+              headers: { Range: 'bytes=0-7' },
+              signal: AbortSignal.timeout(5000)
+            });
+            const buf = await peek.arrayBuffer();
+            const b = new Uint8Array(buf);
+            const hex = Array.from(b).map(x => x.toString(16).padStart(2,'0')).join('');
+            const magic =
+              hex.startsWith('25504446') ? '.pdf'  :  // %PDF
+              hex.startsWith('ffd8ff')   ? '.jpg'  :  // JPEG
+              hex.startsWith('89504e47') ? '.png'  :  // PNG
+              hex.startsWith('52617221') ? '.rar'  :  // Rar!
+              hex.startsWith('377abcaf') ? '.7z'   :  // 7z
+              hex.startsWith('1f8b')     ? '.gz'   :  // gzip
+              hex.startsWith('d0cf11e0') ? '.ppt'  :  // OLE2 (ppt/doc/xls legacy)
+              hex.startsWith('504b0304') ? '.pptx' :  // ZIP-based Office
+              '';
+            if (magic) ext = magic;
+          } catch {}
+        }
 
         return { url, ext };
       }
@@ -432,16 +477,18 @@ async function downloadSingleFile(file, rootFolder) {
     const { url, ext: serverExt } = await resolveRpUrl(file.rpId);
     if (!url) { fail('未获取到下载链接'); return; }
 
-    // 扩展名四级优先：HEAD(CD/CT) > URL路径 > RP_PRIX > 无
+    // 扩展名优先级：HEAD(CD/CT) > RP_PRIX > URL路径(排除服务端脚本后缀)
+    // URL路径排在最后，因为下载代理 URL 形如 download.shtml?...，路径不是真实文件名
+    const SERVER_SCRIPT_EXTS = new Set(['.shtml', '.html', '.htm', '.php', '.asp', '.aspx', '.jsp', '.do', '.action']);
     let ext = serverExt || '';
-    if (!ext) {
-      try {
-        const m = new URL(url).pathname.match(/(\.[a-zA-Z0-9]{2,6})$/);
-        if (m) ext = m[1].toLowerCase();
-      } catch {}
-    }
     if (!ext && file.fileType) {
       ext = '.' + file.fileType.toLowerCase().replace(/^\./, '');
+    }
+    if (!ext) {
+      try {
+        const candidate = new URL(url).pathname.match(/(\.[a-zA-Z0-9]{2,6})$/)?.[1]?.toLowerCase();
+        if (candidate && !SERVER_SCRIPT_EXTS.has(candidate)) ext = candidate;
+      } catch {}
     }
 
     let dlName = (file.fileName || file.name || 'download').trim();
