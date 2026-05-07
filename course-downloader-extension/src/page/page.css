@@ -374,8 +374,9 @@ body {
 }
 .file-name .file-path { margin-top: 1px; }
 .file-path { display: block; color: var(--text-sub); font-size: 11px; margin-top: 2px; }
-.tag-locked { background: #ffeaa7; color: #6c5700; padding: 1px 5px; border-radius: 3px; font-size: 10px; }
-.tag-ok { background: #d1e7dd; color: #0a5535; padding: 1px 5px; border-radius: 3px; font-size: 10px; }
+.tag-locked     { background: #ffeaa7; color: #6c5700;  padding: 1px 5px; border-radius: 3px; font-size: 10px; }
+.tag-ok         { background: #d1e7dd; color: #0a5535;  padding: 1px 5px; border-radius: 3px; font-size: 10px; }
+.tag-downloaded { background: #dbeafe; color: #1d4ed8;  padding: 1px 5px; border-radius: 3px; font-size: 10px; }
 .type-badge {
   display: inline-block;
   font-size: 10px;
@@ -459,4 +460,42 @@ body {
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+
+/* ── 重复下载确认弹窗 ── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.modal-overlay.hidden { display: none !important; }
+.modal-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  width: min(480px, 92vw);
+  max-height: 70vh;
+  display: flex; flex-direction: column; gap: 12px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.18);
+}
+.modal-title   { font-weight: 700; font-size: 14px; }
+.modal-subtitle { font-size: 12px; color: var(--text-sub); }
+.dup-list {
+  overflow-y: auto;
+  max-height: 280px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px;
+}
+.dup-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: 3px;
+  cursor: pointer; font-size: 12px;
+  user-select: none;
+}
+.dup-item:hover { background: var(--bg); }
+.dup-name   { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dup-course { color: var(--text-sub); font-size: 11px; white-space: nowrap; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+.modal-actions { display: flex; align-items: center; gap: 8px; padding-top: 4px; border-top: 1px solid var(--border); }
 ::-webkit-scrollbar-thumb:hover { background: #aaa; }

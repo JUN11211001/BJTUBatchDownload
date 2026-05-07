@@ -400,28 +400,55 @@ async function resolveRpUrl(rpId) {
           }
         } catch {}
 
-        // Priority 4: magic byte detection (Range GET first 8 bytes) — only when all else failed
+        // Priority 4: magic byte detection — only when all else failed
+        // Read 2048 bytes: enough to cover ZIP local file headers (which store directory
+        // names as plain text), letting us distinguish docx/pptx/xlsx without decompression.
         if (!ext) {
           try {
             const peek = await fetch(url, {
               method: 'GET',
-              headers: { Range: 'bytes=0-7' },
-              signal: AbortSignal.timeout(5000)
+              headers: { Range: 'bytes=0-2047' },
+              signal: AbortSignal.timeout(8000)
             });
             const buf = await peek.arrayBuffer();
             const b = new Uint8Array(buf);
-            const hex = Array.from(b).map(x => x.toString(16).padStart(2,'0')).join('');
-            const magic =
-              hex.startsWith('25504446') ? '.pdf'  :  // %PDF
-              hex.startsWith('ffd8ff')   ? '.jpg'  :  // JPEG
-              hex.startsWith('89504e47') ? '.png'  :  // PNG
-              hex.startsWith('52617221') ? '.rar'  :  // Rar!
-              hex.startsWith('377abcaf') ? '.7z'   :  // 7z
-              hex.startsWith('1f8b')     ? '.gz'   :  // gzip
-              hex.startsWith('d0cf11e0') ? '.ppt'  :  // OLE2 (ppt/doc/xls legacy)
-              hex.startsWith('504b0304') ? '.pptx' :  // ZIP-based Office
-              '';
-            if (magic) ext = magic;
+            const hex = Array.from(b.slice(0, 8)).map(x => x.toString(16).padStart(2,'0')).join('');
+
+            if      (hex.startsWith('25504446')) ext = '.pdf';       // %PDF
+            else if (hex.startsWith('ffd8ff'))   ext = '.jpg';       // JPEG
+            else if (hex.startsWith('89504e47')) ext = '.png';       // PNG
+            else if (hex.startsWith('52617221')) ext = '.rar';       // Rar!
+            else if (hex.startsWith('377abcaf')) ext = '.7z';        // 7z
+            else if (hex.startsWith('1f8b'))     ext = '.gz';        // gzip
+            else if (hex.startsWith('d0cf11e0')) {
+              // OLE2: read root directory CLSID at sector 0 offset 80 = file offset 592
+              // CLSID first-4 bytes (little-endian DWORD): Word=06090200, PPT=108d8164, Excel=20080200
+              let oleExt = '';
+              if (b.length >= 596) {
+                const c4 = Array.from(b.slice(592, 596)).map(x => x.toString(16).padStart(2,'0')).join('');
+                if      (c4 === '06090200') oleExt = '.doc';
+                else if (c4 === '108d8164') oleExt = '.ppt';
+                else if (c4 === '20080200') oleExt = '.xls';
+              }
+              if (!oleExt) {
+                // Fallback: scan directory sector (offset 512+) for UTF-16LE stream names
+                const u16 = new TextDecoder('utf-16le', { fatal: false }).decode(b.slice(512));
+                if      (u16.includes('WordDocument')) oleExt = '.doc';
+                else if (u16.includes('PowerPoint'))   oleExt = '.ppt';
+                else if (u16.includes('Workbook') || u16.includes('Book')) oleExt = '.xls';
+                else                                   oleExt = '.ppt';
+              }
+              ext = oleExt;
+            }
+            else if (hex.startsWith('504b0304')) {
+              // ZIP-based Office: local file headers store directory names as plain text.
+              // Scan for the first characteristic subdirectory to tell formats apart.
+              const text = new TextDecoder('utf-8', { fatal: false }).decode(b);
+              if      (text.includes('word/')) ext = '.docx';
+              else if (text.includes('ppt/'))  ext = '.pptx';
+              else if (text.includes('xl/'))   ext = '.xlsx';
+              else                             ext = '.zip';
+            }
           } catch {}
         }
 
@@ -500,7 +527,14 @@ async function downloadSingleFile(file, rootFolder) {
 
     await new Promise((resolve) => {
       const done = (status, msg) => {
-        broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, status, completed: ++completedCount, total: totalCount, msg });
+        if (status === 'success') {
+          chrome.storage.local.get({ downloadedRpIds: [] }, ({ downloadedRpIds }) => {
+            const s = new Set(downloadedRpIds);
+            s.add(file.rpId);
+            chrome.storage.local.set({ downloadedRpIds: [...s] });
+          });
+        }
+        broadcastToPage({ action: 'downloadProgress', type: 'progress', file: file.name, rpId: file.rpId, status, completed: ++completedCount, total: totalCount, msg });
         resolve();
       };
 

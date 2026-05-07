@@ -3,6 +3,7 @@ let sessionId = '';
 let courses = [];
 let courseFiles = {};
 let selectedFiles = new Set();
+let downloadedSet = new Set(); // 持久化已下载 rpId 集合
 let isDownloading = false;
 let completedDl = 0, totalDl = 0;
 let isScanningAll = false;
@@ -237,7 +238,11 @@ function renderFileGroup(course, files) {
               ${f.folderPath ? `<span class="file-path">📁 ${esc(f.folderPath)}</span>` : ''}
             </td>
             <td><span class="type-badge">${esc(fileTypeName(f))}</span></td>
-            <td>${f.canDownload ? '<span class="tag-ok">可下载</span>' : '<span class="tag-locked">受限</span>'}</td>
+            <td id="st-${esc(f.rpId)}">${
+              !f.canDownload ? '<span class="tag-locked">受限</span>'
+              : downloadedSet.has(f.rpId) ? '<span class="tag-downloaded">已下载</span>'
+              : '<span class="tag-ok">可下载</span>'
+            }</td>
           </tr>`).join('')}
       </tbody>`;
 
@@ -304,6 +309,22 @@ function buildSelectedFilesList() {
 function startDownload(files) {
   if (!files.length) { alert('没有可下载的文件'); return; }
   if (isDownloading) { alert('下载进行中，请等待或先停止'); return; }
+
+  const duplicates = files.filter(f => downloadedSet.has(f.rpId));
+  if (duplicates.length > 0) {
+    showDuplicateModal(files, duplicates, (finalFiles) => {
+      if (finalFiles && finalFiles.length > 0) {
+        uncheckAllFiles();
+        doStartDownload(finalFiles);
+      }
+    });
+  } else {
+    uncheckAllFiles();
+    doStartDownload(files);
+  }
+}
+
+function doStartDownload(files) {
   isDownloading = true;
   totalDl = files.length; completedDl = 0;
   updateProgressBar(0, totalDl);
@@ -314,11 +335,51 @@ function startDownload(files) {
   chrome.runtime.sendMessage({ action: 'startDownload', files, sessionId, rootFolder });
 }
 
+function uncheckAllFiles() {
+  document.querySelectorAll('.file-chk:checked').forEach(c => { c.checked = false; onFileCheck(c); });
+  document.querySelectorAll('[id^="chk-all-"]').forEach(c => c.checked = false);
+  document.querySelectorAll('.course-chk:checked').forEach(c => c.checked = false);
+  selectedFiles.clear();
+}
+
+function showDuplicateModal(allFiles, duplicates, callback) {
+  const modal = document.getElementById('dupModal');
+  const list  = document.getElementById('dupModalList');
+  document.getElementById('dupModalSubtitle').textContent =
+    `以下 ${duplicates.length} 个文件已下载过，请勾选要重新下载的文件：`;
+
+  const dupSet = new Set(duplicates.map(f => f.rpId));
+  list.innerHTML = duplicates.map(f => `
+    <label class="dup-item">
+      <input type="checkbox" class="dup-chk" data-rpid="${esc(f.rpId)}" checked>
+      <span class="dup-name" title="${esc(f.name)}">${fileIcon(f.name, f.fileType)} ${esc(f.name)}</span>
+      <span class="dup-course">${esc(f.courseName || '')}</span>
+    </label>`).join('');
+
+  modal.classList.remove('hidden');
+
+  const cleanup = (finalFiles) => { modal.classList.add('hidden'); callback(finalFiles); };
+
+  document.getElementById('dupSelectAll').onclick   = () => list.querySelectorAll('.dup-chk').forEach(c => c.checked = true);
+  document.getElementById('dupDeselectAll').onclick = () => list.querySelectorAll('.dup-chk').forEach(c => c.checked = false);
+  document.getElementById('dupCancel').onclick  = () => cleanup(null);
+  document.getElementById('dupConfirm').onclick = () => {
+    const kept = new Set([...list.querySelectorAll('.dup-chk:checked')].map(c => c.dataset.rpid));
+    cleanup(allFiles.filter(f => !dupSet.has(f.rpId) || kept.has(f.rpId)));
+  };
+}
+
+function markFileDownloaded(rpId) {
+  const td = document.getElementById(`st-${rpId}`);
+  if (td) td.innerHTML = '<span class="tag-downloaded">已下载</span>';
+}
+
 // ── Keep-alive ──
 async function loadStoredSettings() {
-  const { keepAliveEnabled, lastKeepAlive } = await chrome.storage.local.get(['keepAliveEnabled', 'lastKeepAlive']);
+  const { keepAliveEnabled, lastKeepAlive, downloadedRpIds } = await chrome.storage.local.get(['keepAliveEnabled', 'lastKeepAlive', 'downloadedRpIds']);
   document.getElementById('keepAliveToggle').checked = !!keepAliveEnabled;
   if (lastKeepAlive) document.getElementById('keepAliveInfo').textContent = `上次: ${lastKeepAlive}`;
+  if (Array.isArray(downloadedRpIds)) downloadedRpIds.forEach(id => downloadedSet.add(id));
 }
 
 function updateKeepAliveInfo(status, time) {
@@ -337,6 +398,10 @@ chrome.runtime.onMessage.addListener((msg) => {
       const icon = { success: '✓', error: '✗', downloading: '↓' }[msg.status] || '·';
       const detail = msg.msg ? ` (${msg.msg})` : '';
       addLog(`${icon} ${msg.file}${detail}`, msg.status === 'error' ? 'error' : msg.status === 'success' ? 'success' : 'info');
+      if (msg.status === 'success' && msg.rpId) {
+        downloadedSet.add(msg.rpId);
+        markFileDownloaded(msg.rpId);
+      }
     } else if (msg.type === 'done') {
       isDownloading = false;
       document.getElementById('btnStopDownload').classList.add('hidden');
