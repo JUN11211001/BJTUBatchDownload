@@ -33,25 +33,24 @@ async function init() {
     .catch(() => { window._courseLoading = false; renderCourses([]); });
 }
 
-// Direct connectivity check from the page itself (extension host_permissions covers both domains).
-// Avoids service-worker message-passing entirely — no wakeup race, no silent swallow.
 async function checkAndUpdateConn() {
   setConnStatus('mis', 'checking');
   setConnStatus('course', 'checking');
 
-  async function probe(url) {
+  async function probe(url, keyword) {
     try {
       const r = await fetch(url, {
         credentials: 'include', redirect: 'follow',
         cache: 'no-store', signal: AbortSignal.timeout(8000)
       });
-      return r.status < 500;
+      const text = await r.text();
+      return text.includes(keyword);
     } catch { return false; }
   }
 
   const [mis, course] = await Promise.all([
-    probe('https://mis.bjtu.edu.cn/'),
-    probe('http://123.121.147.7:88/ve/')
+    probe('https://mis.bjtu.edu.cn/', '账户信息'),
+    probe('http://123.121.147.7:88/ve/', '课程列表')
   ]);
   updateConnUI({ mis, course });
 }
@@ -498,6 +497,7 @@ function switchTab(name) {
 
 // ── 事件绑定 ──
 function bindEvents() {
+  document.getElementById('btnReload').addEventListener('click', () => location.reload());
   document.getElementById('btnRecheck').addEventListener('click', () => { hideConnWarning(); checkAndUpdateConn(); });
   document.getElementById('btnRetryCheck').addEventListener('click', () => { hideConnWarning(); init(); });
   document.getElementById('connAlertClose').addEventListener('click', hideConnWarning);
